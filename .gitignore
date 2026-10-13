@@ -222,3 +222,4 @@ clients/typescript/dist/
 clients/typescript/coverage/
 clients/typescript/.audit/
 clients/typescript/junit.xml
+.env.forja

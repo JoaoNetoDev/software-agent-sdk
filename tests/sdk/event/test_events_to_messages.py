@@ -737,3 +737,146 @@ class TestEventsToMessages:
         assert msgs[0].role == "assistant"
         assert msgs[1].role == "tool"
         assert msgs[1].tool_call_id == "call_ne"
+
+
+class TestToolResultOrdering:
+    """Providers require tool results to follow the order of their calls."""
+
+    def test_parallel_calls_where_one_fails_validation(self):
+        """A failed sibling call must not push its result ahead of the others.
+
+        ``_handle_tool_calls`` emits the ``AgentErrorEvent`` of a call that
+        fails validation while still iterating the batch, so the result for
+        the second call lands before the first call's observation.
+        """
+        first = create_action_event(
+            thought_text="Reading both files.",
+            tool_name="view_file",
+            tool_call_id="call_1",
+            llm_response_id="response_1",
+            action_args={"command": "view"},
+        )
+        # action=None marks a call that failed argument validation.
+        rejected = ActionEvent(
+            source="agent",
+            thought=[],
+            action=None,
+            tool_name="view_file",
+            tool_call_id="call_2",
+            tool_call=create_tool_call("call_2", "view_file", {"command": "view"}),
+            llm_response_id="response_1",
+        )
+        rejection = AgentErrorEvent(
+            error="Extra inputs are not permitted",
+            tool_name="view_file",
+            tool_call_id="call_2",
+        )
+        observation = ObservationEvent(
+            source="environment",
+            observation=EventsToMessagesMockObservation(result="file contents"),
+            action_id="action_1",
+            tool_name="view_file",
+            tool_call_id="call_1",
+        )
+
+        events = cast(
+            list[LLMConvertibleEvent], [first, rejected, rejection, observation]
+        )
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        assert [message.role for message in messages] == [
+            "assistant",
+            "tool",
+            "tool",
+        ]
+        assert messages[0].tool_calls is not None
+        assert [call.id for call in messages[0].tool_calls] == ["call_1", "call_2"]
+        assert [message.tool_call_id for message in messages[1:]] == [
+            "call_1",
+            "call_2",
+        ]
+
+    def test_results_already_in_order_are_untouched(self):
+        """A consistent history keeps its order and its message objects."""
+        action = create_action_event(
+            thought_text="Checking both.",
+            tool_name="get_weather",
+            tool_call_id="call_a",
+            llm_response_id="response_1",
+            action_args={"location": "current"},
+        )
+        # Only the first action of a batch carries the shared thought.
+        second = ActionEvent(
+            source="agent",
+            thought=[],
+            action=EventsToMessagesMockAction(command="test"),
+            tool_name="get_weather",
+            tool_call_id="call_b",
+            tool_call=create_tool_call(
+                "call_b", "get_weather", {"location": "tomorrow"}
+            ),
+            llm_response_id="response_1",
+        )
+        events = cast(
+            list[LLMConvertibleEvent],
+            [
+                action,
+                second,
+                ObservationEvent(
+                    source="environment",
+                    observation=EventsToMessagesMockObservation(result="sunny"),
+                    action_id="action_a",
+                    tool_name="get_weather",
+                    tool_call_id="call_a",
+                ),
+                ObservationEvent(
+                    source="environment",
+                    observation=EventsToMessagesMockObservation(result="rain"),
+                    action_id="action_b",
+                    tool_name="get_weather",
+                    tool_call_id="call_b",
+                ),
+            ],
+        )
+
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        assert [message.tool_call_id for message in messages[1:]] == [
+            "call_a",
+            "call_b",
+        ]
+
+    def test_unmatched_result_keeps_its_place_at_the_end_of_the_run(self):
+        """An orphan result is kept, not dropped, and sorted after matched ones."""
+        action = create_action_event(
+            thought_text="Looking around.",
+            tool_name="view_file",
+            tool_call_id="call_1",
+            llm_response_id="response_1",
+            action_args={"command": "view"},
+        )
+        events = cast(
+            list[LLMConvertibleEvent],
+            [
+                action,
+                AgentErrorEvent(
+                    error="result of a call that is not in this turn",
+                    tool_name="view_file",
+                    tool_call_id="call_orphan",
+                ),
+                ObservationEvent(
+                    source="environment",
+                    observation=EventsToMessagesMockObservation(result="contents"),
+                    action_id="action_1",
+                    tool_name="view_file",
+                    tool_call_id="call_1",
+                ),
+            ],
+        )
+
+        messages = LLMConvertibleEvent.events_to_messages(events)
+
+        assert [message.tool_call_id for message in messages[1:]] == [
+            "call_1",
+            "call_orphan",
+        ]
