@@ -156,7 +156,54 @@ class LLMConvertibleEvent(Event, ABC):
                     messages.append(msg)
                 i += 1
 
-        return messages
+        return _reorder_tool_results(messages)
+
+
+def _reorder_tool_results(messages: list[Message]) -> list[Message]:
+    """Align tool results with the order their calls were declared in.
+
+    Results are not guaranteed to come back in the order the calls were
+    requested: a failed validation emits its ``AgentErrorEvent`` mid-loop,
+    before the sibling actions execute, and concurrent tools finish on their
+    own schedule. Providers require the ``role="tool"`` messages answering an
+    assistant turn to follow the order of that turn's ``tool_calls``.
+
+    Only the relative order of a contiguous result run changes; a result with
+    no matching call keeps its place at the end of the run, and none is
+    dropped, so an already-consistent history comes back untouched.
+    """
+    ordered: list[Message] = []
+    i = 0
+
+    while i < len(messages):
+        message = messages[i]
+        ordered.append(message)
+
+        declared = [c.id for c in message.tool_calls] if message.tool_calls else []
+        if message.role != "assistant" or not declared:
+            i += 1
+            continue
+
+        end = i + 1
+        while end < len(messages) and messages[end].role == "tool":
+            end += 1
+
+        results = messages[i + 1 : end]
+        if len(results) > 1:
+            rank = {tool_call_id: n for n, tool_call_id in enumerate(declared)}
+            ranked = sorted(
+                enumerate(results),
+                key=lambda pair: (
+                    rank.get(pair[1].tool_call_id, len(declared)),
+                    pair[0],
+                ),
+            )
+            results = [result for _, result in ranked]
+
+        ordered.extend(results)
+        i = end
+
+    return ordered
 
 
 def _is_plain_user_message(message: Message) -> bool:
